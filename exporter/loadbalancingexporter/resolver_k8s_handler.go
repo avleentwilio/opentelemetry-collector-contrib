@@ -37,9 +37,11 @@ func (h handler) OnAdd(obj any, _ bool) {
 	case *discoveryv1.EndpointSlice:
 		ok, endpoints = convertToEndpoints(h.returnNames, object)
 		if !ok {
+			// Some endpoints were missing hostnames and were skipped. Still add
+			// the ones we could resolve; the rest are picked up on a later event
+			// once their hostname is populated.
 			h.logger.Warn(epMissingHostnamesMsg, zap.Any("obj", obj))
 			h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
-			return
 		}
 
 	default: // unsupported
@@ -68,12 +70,17 @@ func (h handler) OnUpdate(oldObj, newObj any) {
 			return
 		}
 
-		_, oldEndpoints := convertToEndpoints(h.returnNames, oldEps)
-		hostnameOk, newEndpoints := convertToEndpoints(h.returnNames, newEps)
-		if !hostnameOk {
+		oldOk, oldEndpoints := convertToEndpoints(h.returnNames, oldEps)
+		newOk, newEndpoints := convertToEndpoints(h.returnNames, newEps)
+		if !oldOk || !newOk {
+			// One or both slices contained endpoints without hostnames. We must
+			// still process the endpoints we could resolve so that pods which
+			// churned out are removed and surviving pods are kept; skipped
+			// endpoints are picked up on a later event once their hostname is
+			// populated. Discarding the whole update here previously stranded
+			// dead pod hostnames in the store forever.
 			h.logger.Warn(epMissingHostnamesMsg, zap.Any("obj", newEps))
 			h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
-			return
 		}
 
 		changed := false
@@ -118,9 +125,10 @@ func (h handler) OnDelete(obj any) {
 		if object != nil {
 			ok, endpoints = convertToEndpoints(h.returnNames, object)
 			if !ok {
+				// Some endpoints lacked hostnames (and so were never tracked);
+				// still remove the ones we can resolve.
 				h.logger.Warn(epMissingHostnamesMsg, zap.Any("obj", obj))
 				h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
-				return
 			}
 		}
 	default: // unsupported
@@ -136,14 +144,27 @@ func (h handler) OnDelete(obj any) {
 	}
 }
 
+// convertToEndpoints extracts the set of routable endpoints from the given
+// EndpointSlices: pod hostnames when retNames is true, otherwise IP addresses.
+//
+// The returned bool reports whether every endpoint could be converted. When
+// retNames is true, any endpoint that does not (yet) have a hostname is skipped
+// and the bool is false, but the endpoints that WERE converted are still
+// returned. Callers must process that partial set rather than discarding it: a
+// pod frequently appears in an EndpointSlice a moment before its Hostname field
+// is populated during a rollout, and dropping the whole slice in that window
+// meant pods that churned out were never removed from the resolver's store,
+// leaking dead pod hostnames without bound.
 func convertToEndpoints(retNames bool, eps ...*discoveryv1.EndpointSlice) (bool, map[string]bool) {
 	res := map[string]bool{}
+	ok := true
 	for _, ep := range eps {
 		for _, endpoint := range ep.Endpoints {
 			for _, addr := range endpoint.Addresses {
 				if retNames {
 					if endpoint.Hostname == nil || *endpoint.Hostname == "" {
-						return false, nil
+						ok = false
+						continue
 					}
 					res[*endpoint.Hostname] = true
 				} else {
@@ -152,5 +173,5 @@ func convertToEndpoints(retNames bool, eps ...*discoveryv1.EndpointSlice) (bool,
 			}
 		}
 	}
-	return true, res
+	return ok, res
 }
