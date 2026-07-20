@@ -70,15 +70,17 @@ func (h handler) OnUpdate(oldObj, newObj any) {
 			return
 		}
 
-		oldOk, oldEndpoints := convertToEndpoints(h.returnNames, oldEps)
+		_, oldEndpoints := convertToEndpoints(h.returnNames, oldEps)
 		newOk, newEndpoints := convertToEndpoints(h.returnNames, newEps)
-		if !oldOk || !newOk {
-			// One or both slices contained endpoints without hostnames. We must
-			// still process the endpoints we could resolve so that pods which
-			// churned out are removed and surviving pods are kept; skipped
-			// endpoints are picked up on a later event once their hostname is
-			// populated. Discarding the whole update here previously stranded
-			// dead pod hostnames in the store forever.
+		if !newOk {
+			// The new slice has endpoint(s) without a hostname yet. Those are
+			// skipped and picked up on a later event once their hostname is
+			// populated. We still process the endpoints we can resolve (below)
+			// instead of returning early, so pods that churned out are removed
+			// and surviving pods are kept -- returning here previously stranded
+			// dead pod hostnames in the store forever. Only the new slice's
+			// validity drives the warning/metric, so recovering from a transient
+			// missing-hostname state is not reported as a resolution failure.
 			h.logger.Warn(epMissingHostnamesMsg, zap.Any("obj", newEps))
 			h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
 		}
